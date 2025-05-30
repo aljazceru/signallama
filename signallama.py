@@ -7,17 +7,21 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from settings import SIGNAL_URL, SIGNAL_NUBMER, OLLAMA_URL, OLLAMA_MODEL
+from settings import SIGNAL_URL, SIGNAL_NUMBER, LLM_MODEL, LLM_API_BASE, LLM_API_KEY, LLM_PROVIDER
 
 import aiohttp
+import litellm
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,  # Changed back to INFO now that we've debugged
+    level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-logger = logging.getLogger("SignalOllamaBridge")
+logger = logging.getLogger("SignalLLMBridge")
+
+# Configure LiteLLM
+litellm.set_verbose = False  # Set to True for debugging
 
 DB_FILE = Path(__file__).parent / "history.db"
 MAX_HISTORY = 10  # number of turns to keep per user
@@ -99,23 +103,31 @@ class SignalConfig:
 
 
 @dataclass
-class OllamaConfig:
-    api_url: str
+class LLMConfig:
     model: str
+    api_base: Optional[str] = None
+    api_key: Optional[str] = None
+    provider: Optional[str] = None
 
 
-class SignalOllamaBridge:
+class SignalLLMBridge:
     def __init__(
         self,
         signal_cfg: SignalConfig,
-        ollama_cfg: OllamaConfig,
+        llm_cfg: LLMConfig,
         context_mgr: ContextManager
     ) -> None:
         self.signal_cfg = signal_cfg
-        self.ollama_cfg = ollama_cfg
+        self.llm_cfg = llm_cfg
         self.context = context_mgr
         self.session: Optional[aiohttp.ClientSession] = None
         self.running = True
+        
+        # Configure LiteLLM settings
+        if llm_cfg.api_base:
+            litellm.api_base = llm_cfg.api_base
+        if llm_cfg.api_key:
+            litellm.api_key = llm_cfg.api_key
 
     async def start(self) -> None:
         init_db(self.context.db_path)
@@ -123,7 +135,7 @@ class SignalOllamaBridge:
         loop = asyncio.get_running_loop()
         loop.add_signal_handler(py_signal.SIGINT, self._stop)
         loop.add_signal_handler(py_signal.SIGTERM, self._stop)
-        logger.info("Bridge started using REST polling mode.")
+        logger.info("Bridge started using REST polling mode with model: %s", self.llm_cfg.model)
         await self._poll_loop()
 
     async def _poll_loop(self) -> None:
@@ -227,29 +239,35 @@ class SignalOllamaBridge:
             await self.session.close()
 
     async def _get_ai_response(self, prompt: str, user: str) -> str:
-        url = f"{self.ollama_cfg.api_url}/api/generate"
         history = self.context.get_history(user)
         
-        # Build context from history
-        context = ""
-        for msg in history:
-            role = "Human" if msg['role'] == 'user' else "Assistant"
-            context += f"{role}: {msg['content']}\n"
-        context += f"Human: {prompt}\nAssistant:"
+        # Build messages in OpenAI format for LiteLLM
+        messages = []
         
-        payload = {
-            'model': self.ollama_cfg.model,
-            'prompt': context,
-            'stream': False
-        }
+        # Add conversation history
+        for msg in history:
+            messages.append({
+                'role': msg['role'],
+                'content': msg['content']
+            })
+        
+        # Add current user message
+        messages.append({
+            'role': 'user',
+            'content': prompt
+        })
         
         try:
-            async with self.session.post(url, json=payload) as resp:
-                resp.raise_for_status()
-                data = await resp.json()
-                
-            # Ollama generate API returns response in 'response' field
-            reply = data['response'].strip()
+            # Use LiteLLM async completion
+            response = await litellm.acompletion(
+                model=self.llm_cfg.model,
+                messages=messages,
+                api_base=self.llm_cfg.api_base,
+                api_key=self.llm_cfg.api_key
+            )
+            
+            # Extract reply from LiteLLM response
+            reply = response.choices[0].message.content.strip()
             
             # Filter out <think></think> content before saving and sending
             filtered_reply = filter_think_tags(reply)
@@ -261,8 +279,8 @@ class SignalOllamaBridge:
             return filtered_reply
             
         except Exception as e:
-            logger.error("Ollama API error: %s", e)
-            return "Sorry, I encountered an error."
+            logger.error("LLM API error: %s", e)
+            return "Sorry, I encountered an error processing your request."
 
     def _stop(self) -> None:
         logger.info("Shutdown signal received.")
@@ -271,15 +289,17 @@ class SignalOllamaBridge:
 
 async def main() -> None:
     signal_cfg = SignalConfig(
-        api_url= SIGNAL_URL,
-        number= SIGNAL_NUBMER
+        api_url=SIGNAL_URL,
+        number=SIGNAL_NUMBER
     )
-    ollama_cfg = OllamaConfig(
-        api_url= OLLAMA_URL,
-        model= OLLAMA_MODEL
+    llm_cfg = LLMConfig(
+        model=LLM_MODEL,
+        api_base=LLM_API_BASE,
+        api_key=LLM_API_KEY,
+        provider=LLM_PROVIDER
     )
     context_mgr = ContextManager(DB_FILE)
-    bridge = SignalOllamaBridge(signal_cfg, ollama_cfg, context_mgr)
+    bridge = SignalLLMBridge(signal_cfg, llm_cfg, context_mgr)
     await bridge.start()
 
 
