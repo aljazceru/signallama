@@ -7,10 +7,15 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from settings import SIGNAL_URL, SIGNAL_NUMBER, LLM_MODEL, LLM_API_BASE, LLM_API_KEY, LLM_PROVIDER
+from settings import SIGNAL_URL, SIGNAL_NUMBER, LLM_MODEL, LLM_API_BASE, LLM_API_KEY, LLM_PROVIDER, WHISPER_URL
 
 import aiohttp
 import litellm
+import tempfile
+import os
+
+# Required packages:
+# pip install litellm aiohttp
 
 # Configure logging
 logging.basicConfig(
@@ -110,15 +115,23 @@ class LLMConfig:
     provider: Optional[str] = None
 
 
+@dataclass
+class WhisperConfig:
+    api_url: str
+    enabled: bool = True
+
+
 class SignalLLMBridge:
     def __init__(
         self,
         signal_cfg: SignalConfig,
         llm_cfg: LLMConfig,
+        whisper_cfg: WhisperConfig,
         context_mgr: ContextManager
     ) -> None:
         self.signal_cfg = signal_cfg
         self.llm_cfg = llm_cfg
+        self.whisper_cfg = whisper_cfg
         self.context = context_mgr
         self.session: Optional[aiohttp.ClientSession] = None
         self.running = True
@@ -135,7 +148,9 @@ class SignalLLMBridge:
         loop = asyncio.get_running_loop()
         loop.add_signal_handler(py_signal.SIGINT, self._stop)
         loop.add_signal_handler(py_signal.SIGTERM, self._stop)
-        logger.info("Bridge started using REST polling mode with model: %s", self.llm_cfg.model)
+        logger.info("Bridge started using REST polling mode with model: %s (Whisper: %s)", 
+                   self.llm_cfg.model, 
+                   "enabled" if self.whisper_cfg.enabled else "disabled")
         await self._poll_loop()
 
     async def _poll_loop(self) -> None:
@@ -205,29 +220,31 @@ class SignalLLMBridge:
                              envelope.get('sourceName'))
                     
                     # Get message content
-                    body = data_message.get('message', '').strip()
+                    body = (data_message.get('message') or '').strip()
                     
-                    if not author or not body:
-                        logger.debug("Missing author (%s) or body (%s), skipping", author, body)
+                    if not author:
+                        logger.debug("Missing author, skipping message")
+                        continue
+                    
+                    # Check if this is a voice message
+                    if self._is_voice_message(data_message):
+                        try:
+                            handled = await self._process_voice_message(data_message, author)
+                            if handled:
+                                continue
+                        except Exception as e:
+                            logger.error("Error processing voice message from %s: %s", author, e)
+                            await self._send_reply(author, "Sorry, I encountered an error processing your voice message.")
+                            continue
+                    
+                    # Handle regular text messages
+                    if not body:
+                        logger.debug("No text content in message, skipping")
                         continue
                         
                     logger.info("Received from %s: %s", author, body)
                     reply = await self._get_ai_response(body, author)
-
-                    payload = {
-                        'number': self.signal_cfg.number,
-                        'recipients': [author],
-                        'message': reply,
-                        'text_mode': 'normal'
-                    }
-                    
-                    try:
-                        async with self.session.post(send_url, json=payload) as resp_send:
-                            resp_send.raise_for_status()
-                            response_data = await resp_send.json()
-                            logger.info("Sent to %s (timestamp: %s)", author, response_data.get('timestamp', 'unknown'))
-                    except Exception as e:
-                        logger.error("Error sending to %s: %s", author, e)
+                    await self._send_reply(author, reply)
 
                 except Exception as e:
                     logger.error("Error processing message: %s", e)
@@ -237,6 +254,154 @@ class SignalLLMBridge:
             
         if self.session:
             await self.session.close()
+
+    def _is_voice_message(self, data_message: Dict[str, Any]) -> bool:
+        """Check if message contains voice attachments"""
+        attachments = data_message.get('attachments', [])
+        if not attachments:
+            return False
+        
+        voice_mime_types = [
+            'audio/aac',
+            'audio/mp4',
+            'audio/mpeg',
+            'audio/ogg',
+            'audio/wav',
+            'audio/webm',
+            'audio/3gpp',
+            'audio/amr'
+        ]
+        
+        for attachment in attachments:
+            content_type = attachment.get('contentType', '').lower()
+            if content_type in voice_mime_types:
+                return True
+        return False
+
+    async def _download_attachment(self, attachment_id: str) -> Optional[bytes]:
+        """Download attachment from Signal API"""
+        try:
+            download_url = f"{self.signal_cfg.api_url}/v1/attachments/{attachment_id}"
+            async with self.session.get(download_url) as resp:
+                if resp.status == 200:
+                    return await resp.read()
+                else:
+                    logger.error("Failed to download attachment %s: HTTP %d", attachment_id, resp.status)
+                    return None
+        except Exception as e:
+            logger.error("Error downloading attachment %s: %s", attachment_id, e)
+            return None
+
+    async def _transcribe_audio(self, audio_data: bytes, filename: str = "audio.ogg") -> Optional[str]:
+        """Transcribe audio using Whisper API"""
+        if not self.whisper_cfg.enabled:
+            return None
+            
+        try:
+            # Create temporary file for audio data
+            with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(filename)[1]) as temp_file:
+                temp_file.write(audio_data)
+                temp_file_path = temp_file.name
+            
+            try:
+                # Prepare multipart form data for Whisper API
+                with open(temp_file_path, 'rb') as audio_file:
+                    form_data = aiohttp.FormData()
+                    form_data.add_field('file', audio_file, filename=filename)
+                    form_data.add_field('model', 'whisper-1')
+                    form_data.add_field('response_format', 'text')
+                    
+                    transcribe_url = f"{self.whisper_cfg.api_url}/v1/audio/transcriptions"
+                    
+                    try:
+                        async with self.session.post(transcribe_url, data=form_data) as resp:
+                            if resp.status == 200:
+                                # Response format depends on Whisper server implementation
+                                content_type = resp.headers.get('Content-Type', '')
+                                if 'application/json' in content_type:
+                                    result = await resp.json()
+                                    return result.get('text', '').strip()
+                                else:
+                                    # Plain text response
+                                    return (await resp.text()).strip()
+                            else:
+                                error_text = await resp.text()
+                                logger.error("Whisper transcription failed: HTTP %d - %s", resp.status, error_text)
+                                return None
+                    except aiohttp.ClientConnectorError:
+                        logger.error("Cannot connect to Whisper service at %s - is it running?", self.whisper_cfg.api_url)
+                        return None
+                    except aiohttp.ClientTimeout:
+                        logger.error("Whisper transcription timed out")
+                        return None
+            finally:
+                # Clean up temporary file
+                try:
+                    os.unlink(temp_file_path)
+                except OSError:
+                    pass
+                    
+        except Exception as e:
+            logger.error("Error transcribing audio: %s", e)
+            return None
+
+    async def _process_voice_message(self, data_message: Dict[str, Any], author: str) -> bool:
+        """Process voice message and send transcription. Returns True if handled."""
+        attachments = data_message.get('attachments', [])
+        
+        for attachment in attachments:
+            content_type = attachment.get('contentType', '').lower()
+            attachment_id = attachment.get('id')
+            
+            if not attachment_id:
+                continue
+                
+            voice_mime_types = [
+                'audio/aac', 'audio/mp4', 'audio/mpeg', 'audio/ogg', 
+                'audio/wav', 'audio/webm', 'audio/3gpp', 'audio/amr'
+            ]
+            
+            if content_type in voice_mime_types:
+                logger.info("Processing voice message from %s (type: %s)", author, content_type)
+                
+                # Download the audio file
+                audio_data = await self._download_attachment(attachment_id)
+                if not audio_data:
+                    await self._send_reply(author, "Sorry, I couldn't download your voice message.")
+                    return True
+                
+                # Transcribe the audio
+                filename = f"voice_message.{content_type.split('/')[-1]}"
+                transcription = await self._transcribe_audio(audio_data, filename)
+                
+                if transcription:
+                    reply = f"Voice message transcription:\n\n{transcription}"
+                    logger.info("Transcribed voice message from %s: %s", author, transcription)
+                else:
+                    reply = "Sorry, I couldn't transcribe your voice message."
+                    
+                await self._send_reply(author, reply)
+                return True
+        
+        return False
+
+    async def _send_reply(self, recipient: str, message: str) -> None:
+        """Send a reply message"""
+        send_url = f"{self.signal_cfg.api_url}/v2/send"
+        payload = {
+            'number': self.signal_cfg.number,
+            'recipients': [recipient],
+            'message': message,
+            'text_mode': 'normal'
+        }
+        
+        try:
+            async with self.session.post(send_url, json=payload) as resp_send:
+                resp_send.raise_for_status()
+                response_data = await resp_send.json()
+                logger.info("Sent to %s (timestamp: %s)", recipient, response_data.get('timestamp', 'unknown'))
+        except Exception as e:
+            logger.error("Error sending to %s: %s", recipient, e)
 
     async def _get_ai_response(self, prompt: str, user: str) -> str:
         history = self.context.get_history(user)
@@ -298,8 +463,12 @@ async def main() -> None:
         api_key=LLM_API_KEY,
         provider=LLM_PROVIDER
     )
+    whisper_cfg = WhisperConfig(
+        api_url=WHISPER_URL,
+        enabled=bool(WHISPER_URL)  # Enable if URL is provided
+    )
     context_mgr = ContextManager(DB_FILE)
-    bridge = SignalLLMBridge(signal_cfg, llm_cfg, context_mgr)
+    bridge = SignalLLMBridge(signal_cfg, llm_cfg, whisper_cfg, context_mgr)
     await bridge.start()
 
 
