@@ -1,5 +1,7 @@
 # signallama
 
+**WARNING - this is under heavy development**
+
 Signal bot to chat with your ollama instance
 
 ## Description
