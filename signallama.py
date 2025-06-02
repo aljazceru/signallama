@@ -162,7 +162,7 @@ class SignalLLMBridge:
             try:
                 params = {
                     "timeout": self.signal_cfg.receive_timeout,
-                    "ignore_attachments": "true",
+                    "ignore_attachments": "false",
                     "ignore_stories": "true"
                 }
                 async with self.session.get(receive_url, params=params) as resp:
