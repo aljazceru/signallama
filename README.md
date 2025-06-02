@@ -13,6 +13,7 @@ Signallama is a bridge between Signal messenger and LLM models. It allows you to
 - Python 3.8+
 - [signal-cli-rest-api](https://github.com/bbernhard/signal-cli-rest-api) - Required for Signal messaging interface
 - Ollama or alternative LLM provider
+- [Whisper ASR Webservice (onerahmet/openai-whisper-asr-webservice)](https://github.com/onerahmet/openai-whisper-asr-webservice) - Required for voice message transcription (see below)
 
 ## Setup
 
@@ -22,6 +23,26 @@ Signallama is a bridge between Signal messenger and LLM models. It allows you to
    - Set your Signal phone number
    - Configure your preferred LLM provider (Ollama by default)
    - Set API details for your LLM
+   - (Optional) Set up Whisper ASR for voice message transcription
+
+### Whisper ASR Webservice (Voice Transcription)
+
+To enable transcription of voice messages, you need to run the [onerahmet/openai-whisper-asr-webservice](https://github.com/onerahmet/openai-whisper-asr-webservice) Docker image:
+
+```bash
+docker run -d --name whisper-asr -p 9000:9000 onerahmet/openai-whisper-asr-webservice:latest
+```
+
+- This will start the ASR service on port 9000 by default.
+- You can access the interactive API docs at [http://localhost:9000/docs](http://localhost:9000/docs)
+
+In your `settings.py`, set the Whisper ASR API URL:
+
+```python
+WHISPER_URL = 'http://localhost:9000'  # Whisper ASR webservice endpoint
+```
+
+If `WHISPER_URL` is set, voice messages sent to the bot will be transcribed and the transcript will be sent as a reply.
 
 ## Configuration
 

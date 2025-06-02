@@ -312,18 +312,30 @@ class SignalLLMBridge:
                     asr_url = f"{self.whisper_cfg.api_url}/asr?output=json"
                     try:
                         async with self.session.post(asr_url, data=form_data) as resp:
+                            response_text = await resp.text()
                             if resp.status == 200:
-                                result = await resp.json()
-                                return result.get('text', '').strip()
+                                try:
+                                    result = json.loads(response_text)
+                                    logger.info("ASR API 200 response JSON: %s", result)
+                                    return result.get('text', '').strip()
+                                except Exception as parse_exc:
+                                    logger.error("Failed to parse ASR API JSON response: %s", parse_exc, exc_info=True)
+                                    logger.error("Raw response text: %s", response_text)
+                                    return None
                             else:
-                                error_text = await resp.text()
-                                logger.error("ASR transcription failed: HTTP %d - %s", resp.status, error_text)
+                                logger.error("ASR transcription failed: HTTP %d - %s", resp.status, response_text)
                                 return None
                     except aiohttp.ClientConnectorError:
-                        logger.error("Cannot connect to ASR service at %s - is it running?", self.whisper_cfg.api_url)
+                        logger.error("Cannot connect to ASR service at %s - is it running?", self.whisper_cfg.api_url, exc_info=True)
                         return None
-                    except aiohttp.ClientTimeout:
-                        logger.error("ASR transcription timed out")
+                    except asyncio.TimeoutError:
+                        logger.error("ASR transcription timed out", exc_info=True)
+                        return None
+                    except aiohttp.ClientError as e:
+                        logger.error("Aiohttp client error: %s", e, exc_info=True)
+                        return None
+                    except Exception as e:
+                        logger.error("Unexpected error during ASR transcription: %s", e, exc_info=True)
                         return None
             finally:
                 # Clean up temporary file
