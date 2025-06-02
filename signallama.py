@@ -205,7 +205,10 @@ class SignalLLMBridge:
                              envelope.get('sourceName'))
                     
                     # Get message content
-                    body = data_message.get('message', '').strip()
+                    raw_body = data_message.get('message', '')
+                    if raw_body is None:
+                        raw_body = ''
+                    body = raw_body.strip()
                     
                     if not author or not body:
                         logger.debug("Missing author (%s) or body (%s), skipping", author, body)
