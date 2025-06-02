@@ -293,10 +293,10 @@ class SignalLLMBridge:
             return None
 
     async def _transcribe_audio(self, audio_data: bytes, filename: str = "audio.ogg") -> Optional[str]:
-        """Transcribe audio using Whisper API"""
+        """Transcribe audio using the new /asr endpoint"""
         if not self.whisper_cfg.enabled:
             return None
-            
+        
         try:
             # Create temporary file for audio data
             with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(filename)[1]) as temp_file:
@@ -304,35 +304,26 @@ class SignalLLMBridge:
                 temp_file_path = temp_file.name
             
             try:
-                # Prepare multipart form data for Whisper API
+                # Prepare multipart form data for /asr endpoint
                 with open(temp_file_path, 'rb') as audio_file:
                     form_data = aiohttp.FormData()
-                    form_data.add_field('file', audio_file, filename=filename)
-                    form_data.add_field('model', 'whisper-1')
-                    form_data.add_field('response_format', 'text')
-                    
-                    transcribe_url = f"{self.whisper_cfg.api_url}/v1/audio/transcriptions"
-                    
+                    form_data.add_field('audio_file', audio_file, filename=filename)
+                    # You can add more fields here if needed (e.g., task, language, etc.)
+                    asr_url = f"{self.whisper_cfg.api_url}/asr?output=json"
                     try:
-                        async with self.session.post(transcribe_url, data=form_data) as resp:
+                        async with self.session.post(asr_url, data=form_data) as resp:
                             if resp.status == 200:
-                                # Response format depends on Whisper server implementation
-                                content_type = resp.headers.get('Content-Type', '')
-                                if 'application/json' in content_type:
-                                    result = await resp.json()
-                                    return result.get('text', '').strip()
-                                else:
-                                    # Plain text response
-                                    return (await resp.text()).strip()
+                                result = await resp.json()
+                                return result.get('text', '').strip()
                             else:
                                 error_text = await resp.text()
-                                logger.error("Whisper transcription failed: HTTP %d - %s", resp.status, error_text)
+                                logger.error("ASR transcription failed: HTTP %d - %s", resp.status, error_text)
                                 return None
                     except aiohttp.ClientConnectorError:
-                        logger.error("Cannot connect to Whisper service at %s - is it running?", self.whisper_cfg.api_url)
+                        logger.error("Cannot connect to ASR service at %s - is it running?", self.whisper_cfg.api_url)
                         return None
                     except aiohttp.ClientTimeout:
-                        logger.error("Whisper transcription timed out")
+                        logger.error("ASR transcription timed out")
                         return None
             finally:
                 # Clean up temporary file
@@ -340,7 +331,6 @@ class SignalLLMBridge:
                     os.unlink(temp_file_path)
                 except OSError:
                     pass
-                    
         except Exception as e:
             logger.error("Error transcribing audio: %s", e)
             return None
