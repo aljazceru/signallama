@@ -93,5 +93,37 @@ LLM_API_KEY = None  # Not needed for Ollama
 # LLM_API_BASE = None
 # LLM_API_KEY = 'your-replicate-api-key'
 
+# === PRIVATEMODE.AI (Privacy-first LLM with hardware attestation) ===
+# LLM_PROVIDER = 'privatemode'
+# LLM_MODEL = 'ibnzterrell/Meta-Llama-3.3-70B-Instruct-AWQ-INT4'  # or 'latest'
+# LLM_API_BASE = 'http://localhost:8080/v1'  # PrivateMode proxy endpoint
+# LLM_API_KEY = 'your-privatemode-api-key'
+# 
+# PrivateMode-specific settings:
+# PRIVATEMODE_PROXY_PORT = 8080  # Port for PrivateMode proxy
+# PRIVATEMODE_VERIFY_ATTESTATION = True  # Enable hardware attestation verification
+# PRIVATEMODE_AUTO_START_PROXY = True  # Automatically start proxy with docker-compose
+
 # Note: For complete list of supported providers and models, see:
 # https://docs.litellm.ai/docs/providers
+
+# === WHISPER ASR CONFIGURATION ===
+# Optional: Set WHISPER_URL for voice message transcription
+# If not set, voice messages will not be transcribed
+WHISPER_URL = None  # Example: 'http://localhost:9000'
+
+# === PRIVATEMODE.AI CONFIGURATION (Optional) ===
+# These settings are only used when LLM_PROVIDER = 'privatemode'
+# If not using PrivateMode, these can be ignored
+
+# PrivateMode proxy port (default: 8080)
+PRIVATEMODE_PROXY_PORT = 8080
+
+# Enable hardware attestation verification (default: True)
+PRIVATEMODE_VERIFY_ATTESTATION = True
+
+# Automatically start PrivateMode proxy with docker-compose (default: True)
+PRIVATEMODE_AUTO_START_PROXY = True
+
+# PrivateMode docker-compose file path (relative to signallama directory)
+PRIVATEMODE_COMPOSE_FILE = '../docker-compose.yml'

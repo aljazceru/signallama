@@ -7,7 +7,22 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from settings import SIGNAL_URL, SIGNAL_NUMBER, LLM_MODEL, LLM_API_BASE, LLM_API_KEY, LLM_PROVIDER, WHISPER_URL
+from settings import (
+    SIGNAL_URL, SIGNAL_NUMBER, LLM_MODEL, LLM_API_BASE, LLM_API_KEY, LLM_PROVIDER, WHISPER_URL
+)
+
+# Import PrivateMode settings with defaults
+try:
+    from settings import (
+        PRIVATEMODE_PROXY_PORT, PRIVATEMODE_VERIFY_ATTESTATION, 
+        PRIVATEMODE_AUTO_START_PROXY, PRIVATEMODE_COMPOSE_FILE
+    )
+except ImportError:
+    # Default values if PrivateMode settings are not defined
+    PRIVATEMODE_PROXY_PORT = 8080
+    PRIVATEMODE_VERIFY_ATTESTATION = True
+    PRIVATEMODE_AUTO_START_PROXY = True
+    PRIVATEMODE_COMPOSE_FILE = '../docker-compose.yml'
 
 import aiohttp
 import litellm
@@ -116,6 +131,14 @@ class LLMConfig:
 
 
 @dataclass
+class PrivateModeConfig:
+    proxy_port: int = 8080
+    verify_attestation: bool = True
+    auto_start_proxy: bool = True
+    compose_file: str = '../docker-compose.yml'
+
+
+@dataclass
 class WhisperConfig:
     api_url: str
     enabled: bool = True
@@ -127,14 +150,17 @@ class SignalLLMBridge:
         signal_cfg: SignalConfig,
         llm_cfg: LLMConfig,
         whisper_cfg: WhisperConfig,
+        privatemode_cfg: PrivateModeConfig,
         context_mgr: ContextManager
     ) -> None:
         self.signal_cfg = signal_cfg
         self.llm_cfg = llm_cfg
         self.whisper_cfg = whisper_cfg
+        self.privatemode_cfg = privatemode_cfg
         self.context = context_mgr
         self.session: Optional[aiohttp.ClientSession] = None
         self.running = True
+        self.privatemode_client = None
         
         # Configure LiteLLM settings
         if llm_cfg.api_base:
@@ -148,10 +174,61 @@ class SignalLLMBridge:
         loop = asyncio.get_running_loop()
         loop.add_signal_handler(py_signal.SIGINT, self._stop)
         loop.add_signal_handler(py_signal.SIGTERM, self._stop)
+        
+        # Initialize PrivateMode if using privatemode provider
+        if self.llm_cfg.provider == 'privatemode':
+            await self._init_privatemode()
+        
         logger.info("Bridge started using REST polling mode with model: %s (Whisper: %s)", 
                    self.llm_cfg.model, 
                    "enabled" if self.whisper_cfg.enabled else "disabled")
         await self._poll_loop()
+
+    async def _init_privatemode(self) -> None:
+        """Initialize PrivateMode proxy and attestation verification."""
+        try:
+            # Import PrivateMode client (only when needed)
+            from privatemode_client import PrivateModeClient
+            
+            # Initialize PrivateMode client
+            self.privatemode_client = PrivateModeClient(
+                api_key=self.llm_cfg.api_key,
+                proxy_port=self.privatemode_cfg.proxy_port,
+                compose_file=self.privatemode_cfg.compose_file
+            )
+            
+            # Auto-start proxy if enabled
+            if self.privatemode_cfg.auto_start_proxy:
+                logger.info("Starting PrivateMode proxy...")
+                if self.privatemode_client.start_proxy():
+                    logger.info("✓ PrivateMode proxy started successfully")
+                else:
+                    logger.error("✗ Failed to start PrivateMode proxy")
+                    raise RuntimeError("PrivateMode proxy failed to start")
+            
+            # Verify attestation if enabled
+            if self.privatemode_cfg.verify_attestation:
+                logger.info("Verifying PrivateMode attestation...")
+                if self.privatemode_client.verify_attestation():
+                    logger.info("✓ PrivateMode attestation verified")
+                    self.privatemode_client.display_security_properties()
+                else:
+                    logger.warning("⚠ PrivateMode attestation verification failed")
+                    logger.warning("Proceeding without attestation verification")
+            
+            # Initialize OpenAI client through PrivateMode
+            if self.privatemode_client.initialize_client():
+                logger.info("✓ PrivateMode OpenAI client initialized")
+            else:
+                logger.error("✗ Failed to initialize PrivateMode OpenAI client")
+                raise RuntimeError("PrivateMode OpenAI client initialization failed")
+                
+        except ImportError:
+            logger.error("PrivateMode client not available. Please install PrivateMode dependencies.")
+            raise
+        except Exception as e:
+            logger.error("Failed to initialize PrivateMode: %s", e)
+            raise
 
     async def _poll_loop(self) -> None:
         # Don't URL encode the number - signal-cli-rest-api expects raw number
@@ -408,7 +485,7 @@ class SignalLLMBridge:
     async def _get_ai_response(self, prompt: str, user: str) -> str:
         history = self.context.get_history(user)
         
-        # Build messages in OpenAI format for LiteLLM
+        # Build messages in OpenAI format
         messages = []
         
         # Add conversation history
@@ -425,16 +502,22 @@ class SignalLLMBridge:
         })
         
         try:
-            # Use LiteLLM async completion
-            response = await litellm.acompletion(
-                model=self.llm_cfg.model,
-                messages=messages,
-                api_base=self.llm_cfg.api_base,
-                api_key=self.llm_cfg.api_key
-            )
-            
-            # Extract reply from LiteLLM response
-            reply = response.choices[0].message.content.strip()
+            # Use PrivateMode client if provider is 'privatemode'
+            if self.llm_cfg.provider == 'privatemode' and self.privatemode_client:
+                reply = self.privatemode_client.chat_completion(messages, self.llm_cfg.model)
+                if not reply:
+                    return "Sorry, I encountered an error processing your request through PrivateMode."
+            else:
+                # Use LiteLLM async completion for other providers
+                response = await litellm.acompletion(
+                    model=self.llm_cfg.model,
+                    messages=messages,
+                    api_base=self.llm_cfg.api_base,
+                    api_key=self.llm_cfg.api_key
+                )
+                
+                # Extract reply from LiteLLM response
+                reply = response.choices[0].message.content.strip()
             
             # Filter out <think></think> content before saving and sending
             filtered_reply = filter_think_tags(reply)
@@ -452,6 +535,11 @@ class SignalLLMBridge:
     def _stop(self) -> None:
         logger.info("Shutdown signal received.")
         self.running = False
+        
+        # Shutdown PrivateMode proxy if it was started
+        if self.privatemode_client and self.privatemode_cfg.auto_start_proxy:
+            logger.info("Shutting down PrivateMode proxy...")
+            self.privatemode_client.shutdown()
 
 
 async def main() -> None:
@@ -465,12 +553,18 @@ async def main() -> None:
         api_key=LLM_API_KEY,
         provider=LLM_PROVIDER
     )
+    privatemode_cfg = PrivateModeConfig(
+        proxy_port=PRIVATEMODE_PROXY_PORT,
+        verify_attestation=PRIVATEMODE_VERIFY_ATTESTATION,
+        auto_start_proxy=PRIVATEMODE_AUTO_START_PROXY,
+        compose_file=PRIVATEMODE_COMPOSE_FILE
+    )
     whisper_cfg = WhisperConfig(
         api_url=WHISPER_URL,
         enabled=bool(WHISPER_URL)  # Enable if URL is provided
     )
     context_mgr = ContextManager(DB_FILE)
-    bridge = SignalLLMBridge(signal_cfg, llm_cfg, whisper_cfg, context_mgr)
+    bridge = SignalLLMBridge(signal_cfg, llm_cfg, whisper_cfg, privatemode_cfg, context_mgr)
     await bridge.start()
 
 
