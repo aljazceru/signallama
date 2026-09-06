@@ -5,3 +5,4 @@ __pycache__/
 *.pyc
 *.pyo
 signal-cli-rest-api/
+.planning/debug/
